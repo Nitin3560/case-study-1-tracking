@@ -47,6 +47,13 @@ class AgenticReplanner:
 
         self.ctrl_hz = float(cfg["sim"]["ctrl_hz"])
 
+    def reset(self):
+        self.e_int[:] = 0.0
+        self.last_t = None
+
+    from typing import Tuple
+    import numpy as np
+
     def compute_rpms(
         self,
         state: np.ndarray,
@@ -55,70 +62,103 @@ class AgenticReplanner:
         p_ref_ahead: np.ndarray,
         v_ref_ahead: np.ndarray,
         yaw_des: float = 0.0,
-    ) -> Tuple[np.ndarray, float]:
+    ) -> Tuple[np.ndarray, float, bool, bool, float, np.ndarray]:
+        """
+        Agentic controller = bias compensator on top of DSLPIDControl.
+
+        What it does:
+        - Lookahead blends the reference (optional, alpha in [0,1]).
+        - Learns a slow XY bias (integral) to cancel persistent drift (wind/GPS bias).
+        - Does NOT add an outer-loop P controller (avoids fighting inner DSLPIDControl).
+
+        Returns:
+        rpms:        (4,) motor rpms
+        err:         XY tracking error magnitude to blended reference (meters)
+        sat:         whether bias correction hit corr_max clamp this step
+        gate_ok:     whether integrator update was allowed this step
+        bias_norm:   ||bias_xy|| magnitude (meters)
+        target_pos_adj: (3,) the actual target_pos passed to inner controller
+        """
 
         cur_pos, cur_quat, cur_vel, cur_ang_vel = _split_state(state)
 
-        # XY error magnitude vs "now" reference
-        err = float(np.linalg.norm((cur_pos - p_ref_now)[:2]))
-
-        # choose targets (nominal vs recovery)
-        if err > self.err_thresh:
-            target_pos = p_ref_ahead
-            v_ref = v_ref_ahead
-            gain = self.kp_boost
-            damp = self.kd_boost
-        else:
-            target_pos = p_ref_now
-            v_ref = v_ref_now
-            gain = 1.0
-            damp = 1.0
-
-        dt = 1.0 / self.ctrl_hz
-
-        # --- OUTER LOOP: PI(D) in XY to reject bias (wind + drift) ---
-        e = np.asarray(target_pos, dtype=float) - np.asarray(cur_pos, dtype=float)
-        e[2] = 0.0
-
-        e_dot = np.asarray(v_ref, dtype=float) - np.asarray(cur_vel, dtype=float)
-        e_dot[2] = 0.0
-
         agentic_cfg = (self.cfg.get("controllers", {}) or {}).get("agentic", {}) or {}
-        kp0 = float(agentic_cfg.get("kp", 1.5))
-        kd0 = float(agentic_cfg.get("kd", 1.0))
-        ki0 = float(agentic_cfg.get("ki", 0.25))  # <-- NEW
+        if not getattr(self, "_printed_cfg", False):
+            print("AGENTIC CFG USED:", agentic_cfg)
+            self._printed_cfg = True
 
-        # Outage/noise gating: only integrate when error is "believable"
-        # (prevents integral exploding during GPS hold/outage jumps)
-        integrate = err < float(agentic_cfg.get("int_gate_err_m", 2.0))
+        # ---------- Lookahead blending (feedforward reference) ----------
+        alpha = float(np.clip(agentic_cfg.get("lookahead_alpha", 0.7), 0.0, 1.0))
 
-        if integrate:
-            self.e_int[:2] += e[:2] * dt
-            # anti-windup clamp
-            self.e_int[0] = float(np.clip(self.e_int[0], -self.int_clamp, self.int_clamp))
-            self.e_int[1] = float(np.clip(self.e_int[1], -self.int_clamp, self.int_clamp))
+        p_now   = np.asarray(p_ref_now, dtype=float)
+        p_ahead = np.asarray(p_ref_ahead, dtype=float)
+        v_now   = np.asarray(v_ref_now, dtype=float)
+        v_ahead = np.asarray(v_ref_ahead, dtype=float)
+
+        target_pos = (1.0 - alpha) * p_now + alpha * p_ahead
+        v_ref      = (1.0 - alpha) * v_now + alpha * v_ahead
+
+        # Keep altitude/vertical speed from "now" reference (agentic is XY only)
+        target_pos = target_pos.copy()
+        v_ref = v_ref.copy()
+        target_pos[2] = float(p_now[2])
+        v_ref[2] = float(v_now[2])
+
+        # ---------- Error (for gating + reporting) ----------
+        e = target_pos - np.asarray(cur_pos, dtype=float)
+        e[2] = 0.0
+        err = float(np.linalg.norm(e[:2]))
+
+        # ---------- Timing ----------
+        dt = 1.0 / float(self.ctrl_hz)
+
+        # ---------- Integrator gating ----------
+        err_gate = float(agentic_cfg.get("int_gate_err_m", 12.0))
+        v_gate = float(agentic_cfg.get("int_gate_v_mps", 8.0))
+
+        vel_xy = float(np.linalg.norm(np.asarray(cur_vel, dtype=float)[:2]))
+        gate_ok = (err < err_gate) and (vel_xy < v_gate)
+
+        # ---------- Persistent bias state ----------
+        if not hasattr(self, "bias_xy"):
+            self.bias_xy = np.zeros(2, dtype=float)
+
+        ki = float(agentic_cfg.get("ki", 0.05))          # slow learning rate
+        leak = float(agentic_cfg.get("int_leak", 0.995)) # decay when gated off
+        clamp = float(agentic_cfg.get("int_clamp", 2.0)) # per-axis clamp
+
+        if gate_ok:
+            # Bias learning (XY)
+            self.bias_xy += ki * e[:2] * dt
+            self.bias_xy[0] = float(np.clip(self.bias_xy[0], -clamp, clamp))
+            self.bias_xy[1] = float(np.clip(self.bias_xy[1], -clamp, clamp))
         else:
-            # mild leak-down so it doesn't stick forever after outages
-            leak = float(agentic_cfg.get("int_leak", 0.995))
-            self.e_int[:2] *= leak
+            self.bias_xy *= leak
 
-        v_cmd = (gain * kp0) * e + (damp * kd0) * e_dot + (gain * ki0) * self.e_int
-        v_cmd[2] = 0.0
+        # ---------- Clamp final correction magnitude ----------
+        corr_max = float(agentic_cfg.get("pos_corr_max_m", 2.0))
+        bias_norm = float(np.linalg.norm(self.bias_xy))
+        sat = False
+        if bias_norm > corr_max:
+            self.bias_xy *= corr_max / (bias_norm + 1e-9)
+            sat = True
+            bias_norm = corr_max
 
-        # clip for stability
-        v_max = float(agentic_cfg.get("v_max", 3.0))
-        sp = float(np.linalg.norm(v_cmd[:2]))
-        if sp > v_max:
-            v_cmd[:2] *= (v_max / (sp + 1e-9))
+        # ---------- Apply bias to target ----------
+        target_pos_adj = target_pos.copy()
+        target_pos_adj[0] += float(self.bias_xy[0])
+        target_pos_adj[1] += float(self.bias_xy[1])
 
+        # ---------- Inner controller (DSLPIDControl) ----------
         rpms, _, _ = self.ctrl.computeControl(
             control_timestep=dt,
             cur_pos=cur_pos,
             cur_quat=cur_quat,
             cur_vel=cur_vel,
             cur_ang_vel=cur_ang_vel,
-            target_pos=target_pos,
+            target_pos=target_pos_adj,
             target_rpy=np.array([0.0, 0.0, yaw_des], dtype=float),
-            target_vel=v_cmd,
+            target_vel=v_ref,  # feedforward trajectory vel ONLY
         )
-        return rpms, err
+
+        return rpms, err, sat, gate_ok, bias_norm, target_pos_adj

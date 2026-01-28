@@ -54,3 +54,16 @@ def formation_error(pos: np.ndarray, desired: np.ndarray) -> float:
     desired = np.asarray(desired, dtype=float)
     assert pos.shape == desired.shape and pos.shape[1] == 3, f"shape mismatch pos={pos.shape}, desired={desired.shape}"
     return float(np.mean(np.linalg.norm((pos - desired)[:, :2], axis=1)))
+
+def formation_error_relative(pos: np.ndarray, offs: np.ndarray) -> float:
+    """
+    Mean XY formation error using COM-relative offsets.
+    pos: (N,3) absolute positions
+    offs: (N,3) desired offsets around the centroid/COM
+    """
+    pos = np.asarray(pos, dtype=float)
+    offs = np.asarray(offs, dtype=float)
+    assert pos.shape == offs.shape and pos.shape[1] == 3
+    com = pos.mean(axis=0)
+    rel = pos - com
+    return float(np.mean(np.linalg.norm((rel - offs)[:, :2], axis=1)))

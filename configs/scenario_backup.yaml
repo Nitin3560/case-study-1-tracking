@@ -47,22 +47,23 @@ controllers:
   agentic:
     kp: 1.4
     kd: 0.9
-    ki: 0.05
+    ki: 0.00
+    kd_boost: 1.2
     v_max: 4.5
-    lookahead_alpha: 0.7
-
-    int_gate_err_m: 12.0
-    int_gate_v_mps: 8.0
-    int_leak: 0.995
+    error_thresh_m: 0.6
+    int_gate_err_m: 50.0
+    int_gate_v_mps: 50.0
     int_clamp: 2.0
-    pos_corr_max_m: 2.0
-
+    int_leak: 0.995
     centroid_k: 0.25
-    centroid_ki: 0.03
-    centroid_int_leak: 0.995
+    lookahead_alpha: 0.7
+    err0_m: 0.6
+    centroid_ki: 0.02
     centroid_int_clamp: 10.0
+    centroid_int_leak: 0.995
     centroid_int_gate_err_m: 25.0
     centroid_int_gate_v_mps: 4.0
+    pos_corr_max_m: 2.0
   sensing:
     openloop: "truth"
     pid: "truth"

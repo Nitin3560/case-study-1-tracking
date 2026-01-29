@@ -1,0 +1,99 @@
+sim:
+  drone_model: "cf2x"
+  physics: "pyb"
+  gui: false
+  freq_hz: 240
+  ctrl_hz: 48
+  duration_s: 40.0
+  num_drones: 4
+  seed: 1
+  debug_obs: false
+
+trajectory:
+  type: "circle"
+  radius_m: 8.0
+  period_s: 18.0
+  altitude_m: 2.0
+  center_xy: [0.0, 0.0]
+
+formation:
+  type: "square"
+  spacing_m: 2.0
+
+disturbance:
+  wind:
+    mode: "phased"
+    phases:
+      - t0_s: 0.0
+        t1_s: 10.0
+        constant_force_n: [0.05, 0.0, 0.0]
+        gust_force_n_max: 0.10
+        gust_interval_s: [3.0, 6.0]
+        gust_duration_s: [0.3, 0.8]
+
+      - t0_s: 10.0
+        t1_s: 25.0
+        constant_force_n: [0.20, 0.00, 0.0]
+        gust_force_n_max: 0.45
+        gust_interval_s: [1.0, 2.5]
+        gust_duration_s: [0.6, 1.4]
+
+      - t0_s: 25.0
+        t1_s: 40.0
+        constant_force_n: [0.08, 0.00, 0.0]
+        gust_force_n_max: 0.20
+        gust_interval_s: [2.0, 4.0]
+        gust_duration_s: [0.3, 0.8]
+
+  gps_drift:
+    enabled: false
+
+metrics:
+  steady_state_after_s: 25.0  # focus on recovery window for headline result
+
+controllers:
+  # IMPORTANT: run_one.py reads sensing from cfg["controllers"]["sensing"]
+  sensing:
+    openloop: "truth"
+    pid: "truth"
+    agentic: "truth"
+
+  # (Optional but recommended) keep PID explicit so it's not using hidden defaults
+  pid:
+    kp: 1.0
+    kd: 0.6
+    ki: 0.008
+    v_max: 3.0
+
+  agentic:
+    supervisor_period_s: 0.5
+    protect_duration_s: 1.0
+    recover_duration_s: 1.0
+
+    lookahead_alpha: 0.7
+    lookahead_s: 0.0
+
+    quiet_err_m: 0.6
+    quiet_vel_mps: 0.4
+
+    act_err_m: 1.2
+    hold_s: 0.8
+    min_improve_mps: 0.05
+    err_ema_beta: 0.05
+    int_gate_v_mps: 3.0
+
+    int_trigger_norm: 0.8
+    int_trigger_growth: 0.002
+
+    pid_int_freeze_on_bad: true
+    pid_int_leak_good: 1.0
+    pid_int_leak_bad: 0.90
+    pid_int_clamp: 2.0
+
+    ki_bias: 0.01
+    bias_int_clamp: 1.0
+    bias_leak: 0.995
+    pos_corr_max_m: 2.0
+
+    pid_int_reset_err_m: 0.0
+    pid_int_reset_hold_s: 1.5

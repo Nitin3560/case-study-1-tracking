@@ -44,19 +44,20 @@ controllers:
     kp_xy: 0.0
 
   agentic:
-      lookahead_alpha: 0.7
-      lookahead_s: 0.0
-      ki: 0.008
-      int_clamp: 2.0
-      pos_corr_max_m: 2.0
-      int_leak: 0.995
-      int_gate_v_mps: 3.0
+    lookahead_alpha: 0.7
+    lookahead_s: 0.0
 
-      quiet_err_m: 0.6
-      act_err_m: 1.2
-      hold_s: 0.8
-      min_improve_mps: 0.05
-      err_ema_beta: 0.05
+    ki: 0.008
+    int_clamp: 2.0
+    pos_corr_max_m: 2.0
+    int_leak: 0.995
+    int_gate_v_mps: 3.0
+
+    quiet_err_m: 0.6
+    act_err_m: 1.2
+    hold_s: 0.8
+    min_improve_mps: 0.05
+    err_ema_beta: 0.05
 
   sensing:
     openloop: "truth"

@@ -11,6 +11,7 @@ class EnvHandles:
     env: CtrlAviary
     dt_sim: float
     dt_ctrl: float
+    sensing_capability: Dict[str, bool]
 
 
 def _drone_model_from_str(s: str) -> DroneModel:
@@ -49,7 +50,7 @@ def make_env(cfg: Dict[str, Any]) -> EnvHandles:
 
     init_xyzs = np.zeros((num, 3), dtype=float)
     for i in range(num):
-        init_xyzs[i] = np.array([0.0 + 0.5 * i, 0.0, altitude], dtype=float)
+        init_xyzs[i] = np.array([0.5 * i, 0.0, altitude], dtype=float)
 
     drone_model_str = str(sim.get("drone_model", "cf2x"))
     physics_str = str(sim.get("physics", "pyb"))
@@ -64,12 +65,24 @@ def make_env(cfg: Dict[str, Any]) -> EnvHandles:
         ctrl_freq=ctrl_hz,
         gui=gui,
     )
-    # Hard-disable user debug GUI input reading in headless runs
+
+    # Disable GUI input in headless mode
     if not gui and hasattr(env, "INPUT_SWITCH"):
         try:
             env.INPUT_SWITCH = -1
         except Exception:
             pass
 
+    # Explicit sensing capability declaration (architectural clarity)
+    sensing_capability = {
+        "truth_state": True,
+        "gps_state": True,
+        "noise_injection": bool(cfg.get("disturbance", {}).get("gps_drift", {}).get("enabled", False)),
+    }
 
-    return EnvHandles(env=env, dt_sim=dt_sim, dt_ctrl=dt_ctrl)
+    return EnvHandles(
+        env=env,
+        dt_sim=dt_sim,
+        dt_ctrl=dt_ctrl,
+        sensing_capability=sensing_capability,
+    )

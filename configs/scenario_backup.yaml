@@ -44,26 +44,67 @@ controllers:
     waypoint_dt_s: 1.0
     v_max: 3.0 
     kp_xy: 1.0
+  sim:
+  drone_model: "cf2x"
+  physics: "pyb"
+  gui: false
+  freq_hz: 240
+  ctrl_hz: 48
+  duration_s: 40
+  num_drones: 4
+  seed: 1
+  debug_obs: false
+
+trajectory:
+  type: "circle"
+  radius_m: 5.0
+  period_s: 25.0
+  altitude_m: 2.0
+  center_xy: [0.0, 0.0]
+
+formation:
+  type: "square"
+  spacing_m: 2.0
+
+disturbance:
+  wind:
+    mode: "gust"
+    constant_force_n: [0.15, 0.0, 0.0]
+    gust_force_n_max: 0.5
+    gust_interval_s: [2.0, 5.0]
+    gust_duration_s: [0.3, 1.0]
+  gps_drift:
+    enabled: true
+    random_walk_std_m_per_s: 0.02
+    noise_std_m: 0.05
+    outage:
+      enabled: true
+      prob_per_s: 0.03
+      duration_s: [1.0, 3.0]
+
+metrics:
+  steady_state_after_s: 10.0
+
+controllers:
+  openloop:
+    waypoint_dt_s: 1.0
+    v_max: 3.0 
+    kp_xy: 1.0
   agentic:
-    kp: 1.4
-    kd: 0.9
-    ki: 0.00
-    kd_boost: 1.2
-    v_max: 4.5
-    error_thresh_m: 0.6
-    int_gate_err_m: 50.0
-    int_gate_v_mps: 50.0
-    int_clamp: 2.0
-    int_leak: 0.995
-    centroid_k: 0.25
     lookahead_alpha: 0.7
-    err0_m: 0.6
-    centroid_ki: 0.02
-    centroid_int_clamp: 10.0
-    centroid_int_leak: 0.995
-    centroid_int_gate_err_m: 25.0
-    centroid_int_gate_v_mps: 4.0
-    pos_corr_max_m: 2.0
+    lookahead_s: 0.0
+
+    ki: 0.05
+    int_clamp: 10.0
+    pos_corr_max_m: 8.0
+    int_leak: 0.995
+    int_gate_v_mps: 8.0
+
+    quiet_err_m: 2.0
+    act_err_m: 3.0
+    hold_s: 1.0
+    min_improve_mps: 0.2
+    err_ema_beta: 0.05
   sensing:
     openloop: "truth"
     pid: "truth"

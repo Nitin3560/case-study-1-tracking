@@ -55,6 +55,7 @@ def formation_error(pos: np.ndarray, desired: np.ndarray) -> float:
     assert pos.shape == desired.shape and pos.shape[1] == 3, f"shape mismatch pos={pos.shape}, desired={desired.shape}"
     return float(np.mean(np.linalg.norm((pos - desired)[:, :2], axis=1)))
 
+
 def formation_error_relative(pos: np.ndarray, offs: np.ndarray) -> float:
     """
     Mean XY formation error using COM-relative offsets.

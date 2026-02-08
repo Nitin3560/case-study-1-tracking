@@ -1,9 +1,13 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Dict, Tuple
 import numpy as np
 
 
+# ----------------------------
+# Backward-compatible log type
+# ----------------------------
 @dataclass
 class MetricsLog:
     ts: List[float]
@@ -13,6 +17,41 @@ class MetricsLog:
     connectivity_ok: List[float]
 
 
+# -----------------------------------------
+# New (optional) richer log for paper clarity
+# -----------------------------------------
+@dataclass
+class MetricsLogV2:
+    """
+    Optional richer log that makes "nominal vs commanded reference" explicit.
+
+    - *_nominal: error against mission reference (what you *evaluate*)
+    - *_cmd:     error against commanded reference (what controller *tracks*)
+
+    You can populate either/both depending on the experiment.
+    """
+    ts: List[float]
+
+    # tracking error vs nominal reference
+    mean_err_nominal: List[float]
+    max_err_nominal: List[float]
+
+    # tracking error vs commanded reference (optional)
+    mean_err_cmd: Optional[List[float]] = None
+    max_err_cmd: Optional[List[float]] = None
+
+    # formation + connectivity (same meaning as before)
+    formation_err: Optional[List[float]] = None
+    formation_err_relative: Optional[List[float]] = None
+    connectivity_ok: Optional[List[float]] = None
+
+    # optional debugging channels (not required)
+    extra: Optional[Dict[str, List[float]]] = None
+
+
+# ----------------------------
+# Connectivity + formation
+# ----------------------------
 def connectivity_rate(pos: np.ndarray, comm_range_m: float = 10.0, use_3d: bool = False) -> float:
     """
     Fraction of drones that have at least one neighbor within communication range.
@@ -68,3 +107,125 @@ def formation_error_relative(pos: np.ndarray, offs: np.ndarray) -> float:
     com = pos.mean(axis=0)
     rel = pos - com
     return float(np.mean(np.linalg.norm((rel - offs)[:, :2], axis=1)))
+
+
+# -----------------------------------------
+# New: explicit tracking error computations
+# -----------------------------------------
+def tracking_errors_xy(pos: np.ndarray, ref: np.ndarray) -> Tuple[float, float]:
+    """
+    Compute mean and max XY tracking error for a swarm.
+
+    pos: (N,3) actual positions
+    ref: (N,3) reference positions (nominal mission ref OR commanded ref)
+    Returns: (mean_xy_err, max_xy_err)
+    """
+    pos = np.asarray(pos, dtype=float)
+    ref = np.asarray(ref, dtype=float)
+    assert pos.shape == ref.shape and pos.shape[1] == 3, f"shape mismatch pos={pos.shape}, ref={ref.shape}"
+    e = (pos - ref)[:, :2]
+    norms = np.linalg.norm(e, axis=1)
+    return float(np.mean(norms)), float(np.max(norms))
+
+
+def tracking_errors_com_xy(pos: np.ndarray, ref_com: np.ndarray) -> Tuple[float, float]:
+    """
+    Compute mean and max XY error of drone positions relative to a reference COM trajectory.
+    Useful when you only have COM reference (1,3) or (3,).
+
+    pos: (N,3)
+    ref_com: (3,) or (1,3) or (T,3) if you pass single timestep slice
+    """
+    pos = np.asarray(pos, dtype=float)
+    ref_com = np.asarray(ref_com, dtype=float).reshape(-1)
+    assert pos.ndim == 2 and pos.shape[1] == 3 and ref_com.shape[0] == 3
+    com = pos.mean(axis=0)
+    e_xy = (com - ref_com)[:2]
+    # mean/max are same for COM scalar; return as (abs, abs)
+    val = float(np.linalg.norm(e_xy))
+    return val, val
+
+
+# ---------------------------------------------------
+# New: temporal (time-series) summary helper functions
+# ---------------------------------------------------
+@dataclass
+class TemporalSummary:
+    """
+    Simple transient/steady-state summary for a 1D error time series.
+    """
+    peak: float
+    rms: float
+    steady_mean: float
+    steady_max: float
+    settling_time_s: Optional[float]
+
+
+def temporal_summary(
+    ts: np.ndarray,
+    err: np.ndarray,
+    *,
+    steady_start_s: Optional[float] = None,
+    settle_band: float = 0.1,
+    settle_hold_s: float = 1.0,
+) -> TemporalSummary:
+    """
+    Summarize temporal structure of an error signal.
+
+    Args:
+      ts: (T,) timestamps in seconds, increasing
+      err: (T,) nonnegative error magnitude over time (e.g., mean XY error each tick)
+      steady_start_s: if provided, steady-state window begins at this time
+      settle_band: band for settling, expressed as a fraction of peak (e.g., 0.1 => within 10% of peak)
+      settle_hold_s: must remain within band for this duration to count as settled
+
+    Notes:
+      - This is conservative and robust for reviewer-friendly reporting.
+      - If err never settles, settling_time_s=None.
+    """
+    ts = np.asarray(ts, dtype=float).reshape(-1)
+    err = np.asarray(err, dtype=float).reshape(-1)
+    assert ts.shape == err.shape and ts.size > 1, f"ts/err shape mismatch {ts.shape} vs {err.shape}"
+    assert np.all(np.diff(ts) >= 0.0), "ts must be nondecreasing"
+    err = np.maximum(err, 0.0)
+
+    peak = float(np.max(err))
+    rms = float(np.sqrt(np.mean(err ** 2)))
+
+    # steady window
+    if steady_start_s is None:
+        # default: last 25% of samples
+        idx0 = int(0.75 * len(ts))
+    else:
+        idx0 = int(np.searchsorted(ts, float(steady_start_s), side="left"))
+        idx0 = max(0, min(idx0, len(ts) - 1))
+
+    steady = err[idx0:]
+    steady_mean = float(np.mean(steady))
+    steady_max = float(np.max(steady))
+
+    # settling time: first time after which signal stays within band for settle_hold_s
+    # band is defined relative to peak; if peak=0 -> settled at t0
+    if peak <= 1e-12:
+        settling_time_s = float(ts[0])
+    else:
+        band_val = float(settle_band) * peak
+        # Find earliest t such that for next hold window, err <= band_val
+        settling_time_s = None
+        for k in range(len(ts)):
+            t0 = ts[k]
+            t1 = t0 + float(settle_hold_s)
+            j = int(np.searchsorted(ts, t1, side="right"))
+            if j <= k:
+                continue
+            if np.all(err[k:j] <= band_val):
+                settling_time_s = float(t0)
+                break
+
+    return TemporalSummary(
+        peak=peak,
+        rms=rms,
+        steady_mean=steady_mean,
+        steady_max=steady_max,
+        settling_time_s=settling_time_s,
+    )

@@ -42,8 +42,10 @@ def aggregate(controller: str, seeds: List[int]) -> pd.DataFrame:
 def mean_ci_over_seeds(df: pd.DataFrame, col: str) -> Tuple[pd.Series, pd.Series]:
     """
     95% CI over seeds at each time t.
-    NOTE: We compute statistics over all rows grouped by time. Since each seed produces
-    one row per control tick, groupby('t') works.
+
+    Assumption (true for this project):
+      Each seed produces one row per control tick, so grouping by 't' yields
+      one sample per seed per time.
     """
     if col not in df.columns:
         raise KeyError(f"Column '{col}' not found. Available: {list(df.columns)}")
@@ -53,12 +55,20 @@ def mean_ci_over_seeds(df: pd.DataFrame, col: str) -> Tuple[pd.Series, pd.Series
     std = g.std(ddof=1)
     n = g.count()
     ci = 1.96 * (std / np.sqrt(n))
+
     # std can be NaN if n==1 at any t; replace with 0 CI in that case
     ci = ci.fillna(0.0)
     return mean, ci
 
 
-def plot_curve(df: pd.DataFrame, col: str, title: str, outpath: Path):
+def plot_curve(
+    df: pd.DataFrame,
+    col: str,
+    title: str,
+    outpath: Path,
+    *,
+    ylabel: str | None = None,
+):
     mean, ci = mean_ci_over_seeds(df, col)
     t = mean.index.values
 
@@ -66,7 +76,7 @@ def plot_curve(df: pd.DataFrame, col: str, title: str, outpath: Path):
     plt.plot(t, mean.values)
     plt.fill_between(t, (mean - ci).values, (mean + ci).values, alpha=0.2)
     plt.xlabel("Time (s)")
-    plt.ylabel(col)
+    plt.ylabel(ylabel if ylabel is not None else col)
     plt.title(title)
 
     outpath.parent.mkdir(parents=True, exist_ok=True)
@@ -85,14 +95,38 @@ def summarize(df: pd.DataFrame, controller_name: str) -> Dict[str, Any]:
     def _max(col: str) -> float:
         return float(df[col].max()) if col in df.columns else float("nan")
 
-    return {
+    # In this project:
+    #   mean_err_m / max_err_m should be NOMINAL mission-reference error (after run_one fix).
+    mean_nom = _mean("mean_err_m")
+    max_nom = _max("max_err_m")
+
+    # Commanded-reference error (only differs for agentic; optional)
+    mean_cmd = _mean("mean_err_cmd_m")
+    max_cmd = _max("max_err_cmd_m")
+
+    out = {
         "controller": controller_name,
-        "mean_err_m": _mean("mean_err_m"),
-        "max_err_m": _max("max_err_m"),
-        "com_err_m": _mean("com_err_m"),                 # KEY metric for trajectory tracking
-        "formation_err_m": _mean("formation_err_m"),
+
+        # Explicit, paper-safe names
+        "mean_err_nominal_m": mean_nom,
+        "max_err_nominal_m": max_nom,
+
+        "mean_err_cmd_m": mean_cmd,
+        "max_err_cmd_m": max_cmd,
+
+        "formation_err_rel": _mean("formation_err_rel"),
         "connectivity_rate": _mean("connectivity_rate"),
+
+        # Agentic interpretability channels (optional)
+        "agentic_active_rate": _mean("agentic_active"),
+        "agentic_ref_shift_mean": _mean("agentic_ref_shift"),
     }
+
+    # Backward-compatible legacy columns (do not remove unless you update downstream)
+    out["mean_err_m"] = mean_nom
+    out["max_err_m"] = max_nom
+
+    return out
 
 
 def main():
@@ -126,21 +160,123 @@ def main():
     pid_df = aggregate("pid", seeds)
     ag_df = aggregate("agentic", seeds)
 
-    # ---- Figures ----
     figs = Path("outputs/figs")
 
-    # Track error curves (existing metric)
-    plot_curve(open_df, "mean_err_m", "Open-loop mean tracking error (mean ± 95% CI)", figs / "openloop_mean_err.png")
-    plot_curve(pid_df,  "mean_err_m", "PID mean tracking error (mean ± 95% CI)",        figs / "pid_mean_err.png")
-    plot_curve(ag_df,   "mean_err_m", "Agentic mean tracking error (mean ± 95% CI)",    figs / "agentic_mean_err.png")
+    # ------------------------------------------------------------------
+    # Figures: NOMINAL mission-reference tracking error (primary metric)
+    # ------------------------------------------------------------------
+    plot_curve(
+        open_df,
+        "mean_err_m",
+        "Open-loop mean NOMINAL tracking error (mean ± 95% CI)",
+        figs / "openloop_mean_err_nominal.png",
+        ylabel="mean_err_nominal_m",
+    )
+    plot_curve(
+        pid_df,
+        "mean_err_m",
+        "PID mean NOMINAL tracking error (mean ± 95% CI)",
+        figs / "pid_mean_err_nominal.png",
+        ylabel="mean_err_nominal_m",
+    )
+    plot_curve(
+        ag_df,
+        "mean_err_m",
+        "Agentic mean NOMINAL tracking error (mean ± 95% CI)",
+        figs / "agentic_mean_err_nominal.png",
+        ylabel="mean_err_nominal_m",
+    )
 
-    # Centroid tracking error curves (magazine-aligned). Only plot if column exists.
-    if "com_err_m" in open_df.columns and "com_err_m" in pid_df.columns and "com_err_m" in ag_df.columns:
-        plot_curve(open_df, "com_err_m", "Open-loop COM tracking error (mean ± 95% CI)", figs / "openloop_com_err.png")
-        plot_curve(pid_df,  "com_err_m", "PID COM tracking error (mean ± 95% CI)",       figs / "pid_com_err.png")
-        plot_curve(ag_df,   "com_err_m", "Agentic COM tracking error (mean ± 95% CI)",   figs / "agentic_com_err.png")
+    # ------------------------------------------------------------------
+    # Figures: COMMANDED-reference tracking error (optional diagnostic)
+    # ------------------------------------------------------------------
+    if (
+        "mean_err_cmd_m" in open_df.columns
+        and "mean_err_cmd_m" in pid_df.columns
+        and "mean_err_cmd_m" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "mean_err_cmd_m",
+            "Open-loop mean COMMANDED tracking error (mean ± 95% CI)",
+            figs / "openloop_mean_err_cmd.png",
+            ylabel="mean_err_cmd_m",
+        )
+        plot_curve(
+            pid_df,
+            "mean_err_cmd_m",
+            "PID mean COMMANDED tracking error (mean ± 95% CI)",
+            figs / "pid_mean_err_cmd.png",
+            ylabel="mean_err_cmd_m",
+        )
+        plot_curve(
+            ag_df,
+            "mean_err_cmd_m",
+            "Agentic mean COMMANDED tracking error (mean ± 95% CI)",
+            figs / "agentic_mean_err_cmd.png",
+            ylabel="mean_err_cmd_m",
+        )
 
-    # ---- Summary CSV (THIS WAS MISSING IN YOUR FILE) ----
+    # ------------------------------------------------------------------
+    # Figures: formation + connectivity (only if present)
+    # ------------------------------------------------------------------
+    if (
+        "formation_err_rel" in open_df.columns
+        and "formation_err_rel" in pid_df.columns
+        and "formation_err_rel" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "formation_err_rel",
+            "Open-loop relative formation error (mean ± 95% CI)",
+            figs / "openloop_formation_err_rel.png",
+            ylabel="formation_err_rel",
+        )
+        plot_curve(
+            pid_df,
+            "formation_err_rel",
+            "PID relative formation error (mean ± 95% CI)",
+            figs / "pid_formation_err_rel.png",
+            ylabel="formation_err_rel",
+        )
+        plot_curve(
+            ag_df,
+            "formation_err_rel",
+            "Agentic relative formation error (mean ± 95% CI)",
+            figs / "agentic_formation_err_rel.png",
+            ylabel="formation_err_rel",
+        )
+
+    if (
+        "connectivity_rate" in open_df.columns
+        and "connectivity_rate" in pid_df.columns
+        and "connectivity_rate" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "connectivity_rate",
+            "Open-loop connectivity rate (mean ± 95% CI)",
+            figs / "openloop_connectivity_rate.png",
+            ylabel="connectivity_rate",
+        )
+        plot_curve(
+            pid_df,
+            "connectivity_rate",
+            "PID connectivity rate (mean ± 95% CI)",
+            figs / "pid_connectivity_rate.png",
+            ylabel="connectivity_rate",
+        )
+        plot_curve(
+            ag_df,
+            "connectivity_rate",
+            "Agentic connectivity rate (mean ± 95% CI)",
+            figs / "agentic_connectivity_rate.png",
+            ylabel="connectivity_rate",
+        )
+
+    # ------------------------------------------------------------------
+    # Summary CSV (explicit semantics)
+    # ------------------------------------------------------------------
     summary_rows = [
         summarize(open_df, "openloop"),
         summarize(pid_df, "pid"),

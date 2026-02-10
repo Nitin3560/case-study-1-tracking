@@ -85,6 +85,112 @@ def connectivity_rate(pos: np.ndarray, comm_range_m: float = 10.0, use_3d: bool 
     return ok / n
 
 
+def adjacency_matrix(pos: np.ndarray, comm_range_m: float, use_3d: bool = False) -> np.ndarray:
+    """
+    Build an undirected adjacency matrix (N,N) where A[i,j]=1 if j is within comm range of i.
+    """
+    pos = np.asarray(pos, dtype=float)
+    assert pos.ndim == 2 and pos.shape[1] == 3
+    n = pos.shape[0]
+    A = np.zeros((n, n), dtype=int)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if use_3d:
+                d = np.linalg.norm(pos[i] - pos[j])
+            else:
+                d = np.linalg.norm(pos[i, :2] - pos[j, :2])
+            if d <= comm_range_m:
+                A[i, j] = 1
+    return A
+
+
+def connected_components(adj: np.ndarray) -> List[List[int]]:
+    """
+    Return list of connected components from adjacency matrix (undirected assumed).
+    """
+    n = adj.shape[0]
+    seen = [False] * n
+    comps: List[List[int]] = []
+    for i in range(n):
+        if seen[i]:
+            continue
+        stack = [i]
+        seen[i] = True
+        comp = []
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            nbrs = np.where(adj[u] > 0)[0]
+            for v in nbrs:
+                if not seen[v]:
+                    seen[v] = True
+                    stack.append(v)
+        comps.append(comp)
+    return comps
+
+
+def avg_shortest_path(adj: np.ndarray) -> float:
+    """
+    Average shortest-path length over connected pairs only.
+    Returns np.inf if no connected pairs exist.
+    """
+    n = adj.shape[0]
+    if n <= 1:
+        return 0.0
+    total = 0.0
+    count = 0
+    for i in range(n):
+        # BFS
+        dist = -np.ones(n, dtype=int)
+        dist[i] = 0
+        queue = [i]
+        for u in queue:
+            for v in np.where(adj[u] > 0)[0]:
+                if dist[v] < 0:
+                    dist[v] = dist[u] + 1
+                    queue.append(v)
+        for j in range(i + 1, n):
+            if dist[j] > 0:
+                total += dist[j]
+                count += 1
+    return float(total / count) if count > 0 else float("inf")
+
+
+def throughput_ratio(adj: np.ndarray, demand: np.ndarray) -> float:
+    """
+    Simple throughput proxy: fraction of traffic demand pairs that are connected.
+    demand: (N,N) symmetric, nonnegative, zeros on diagonal.
+    """
+    n = adj.shape[0]
+    comps = connected_components(adj)
+    comp_id = np.full(n, -1, dtype=int)
+    for k, comp in enumerate(comps):
+        for i in comp:
+            comp_id[i] = k
+    total = float(np.sum(demand) / 2.0)
+    if total <= 0:
+        return 0.0
+    ok = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if comp_id[i] == comp_id[j]:
+                ok += float(demand[i, j])
+    return ok / total
+
+
+def control_overhead_ratio(adj: np.ndarray) -> float:
+    """
+    Control overhead proxy: average neighbor fraction per drone.
+    """
+    n = adj.shape[0]
+    if n <= 1:
+        return 0.0
+    neighbors = np.sum(adj > 0, axis=1)
+    return float(np.mean(neighbors / max(n - 1, 1)))
+
+
 def formation_error(pos: np.ndarray, desired: np.ndarray) -> float:
     """
     Mean XY formation error against desired (N,3).

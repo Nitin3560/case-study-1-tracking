@@ -20,6 +20,11 @@ class DriftState:
     last_meas: Optional[np.ndarray] = None
 
 
+@dataclass
+class FailureState:
+    failed_until: Dict[int, float] = field(default_factory=dict)
+
+
 def _sorted_pair(x) -> Tuple[float, float]:
     """Return (lo, hi) sorted and safe."""
     lo, hi = float(x[0]), float(x[1])
@@ -82,6 +87,23 @@ class DisturbanceModel:
 
         self.wind = WindState()
         self.drift = DriftState(bias=np.zeros(3, dtype=float))
+        self.failures = FailureState()
+
+        self.failure_cfg = (dist_cfg.get("failures", {}) or {})
+        self.failure_enabled = bool(self.failure_cfg.get("enabled", False))
+
+        # Precompute deterministic failure events if provided
+        self.failure_events = []
+        if self.failure_enabled:
+            events = self.failure_cfg.get("events", []) or []
+            for ev in events:
+                try:
+                    drone_id = int(ev.get("drone_id"))
+                    t_fail = float(ev.get("t_fail_s"))
+                    duration = float(ev.get("duration_s", 1e9))
+                    self.failure_events.append((drone_id, t_fail, duration))
+                except Exception:
+                    continue
 
     # -------------------------
     # Wind helpers
@@ -204,6 +226,42 @@ class DisturbanceModel:
                 flags=p.WORLD_FRAME,
                 physicsClientId=env.CLIENT,
             )
+
+    # -------------------------
+    # Failure model
+    # -------------------------
+    def failed_drones(self, t: float, n: int) -> Dict[int, bool]:
+        """
+        Return dict of failed drones at time t.
+        Failure can be configured as deterministic events or random outages.
+        """
+        failed = {i: False for i in range(n)}
+        if not self.failure_enabled:
+            return failed
+
+        # deterministic events
+        for drone_id, t_fail, duration in self.failure_events:
+            if 0 <= drone_id < n:
+                if t_fail <= t < (t_fail + duration):
+                    failed[drone_id] = True
+
+        # random outage model
+        rand_cfg = self.failure_cfg.get("random", {}) or {}
+        if rand_cfg.get("enabled", False):
+            prob_per_s = float(rand_cfg.get("prob_per_s", 0.0))
+            duration_s = rand_cfg.get("duration_s", [1.0, 3.0])
+            dur_lo, dur_hi = _sorted_pair(duration_s)
+            for i in range(n):
+                until = self.failures.failed_until.get(i, 0.0)
+                if t < until:
+                    failed[i] = True
+                    continue
+                if self.rng.uniform() < prob_per_s * max(1e-9, float(rand_cfg.get("dt_s", 0.02))):
+                    dur = self.rng.uniform(dur_lo, max(dur_hi, dur_lo + 1e-9))
+                    self.failures.failed_until[i] = t + dur
+                    failed[i] = True
+
+        return failed
 
     # -------------------------
     # GPS measurement model

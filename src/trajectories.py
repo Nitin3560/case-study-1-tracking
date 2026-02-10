@@ -51,14 +51,19 @@ def p_ref(cfg: Dict[str, Any], t: float) -> Tuple[np.ndarray, np.ndarray]:
 
     if typ == "lawnmower":
         L = 2 * R
-        speed = L / (T / 4)
+        leg_T = T / 4
+        speed = L / leg_T
         phase = (t % T) / T
-        y = cy + (phase * 2 - 1) * R
-        if int(phase * 4) % 2 == 0:
-            x = cx - R + speed * (t % (T / 4))
+        lane = int(phase * 4)
+        if lane > 3:
+            lane = 3
+        y_levels = np.linspace(-R, R, 4)
+        y = cy + y_levels[lane]
+        if lane % 2 == 0:
+            x = cx - R + speed * (t % leg_T)
             vx = speed
         else:
-            x = cx + R - speed * (t % (T / 4))
+            x = cx + R - speed * (t % leg_T)
             vx = -speed
         return np.array([x, y, z], dtype=float), np.array([vx, 0.0, 0.0], dtype=float)
 

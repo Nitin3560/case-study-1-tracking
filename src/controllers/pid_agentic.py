@@ -96,6 +96,14 @@ class PIDAgenticController:
         if self.v_cmd_limit_mps is not None:
             self.v_cmd_limit_mps = float(self.v_cmd_limit_mps)
 
+        # Closed-loop agentic gating (error-aware)
+        self.error_gate_m = float(ag_cfg.get("error_gate_m", 0.5))
+        self.error_scale_m = float(ag_cfg.get("error_scale_m", 1.5))
+
+        # Comm-aware bias (toward centroid if isolated)
+        self.comm_bias_m = float(ag_cfg.get("comm_bias_m", 0.15))
+        self.comm_min_neighbors = int(ag_cfg.get("comm_min_neighbors", 1))
+
         # -------------------------
         # Saturation detection (graded)
         # -------------------------
@@ -115,6 +123,10 @@ class PIDAgenticController:
                 self.ctrl.reset()
             except TypeError:
                 pass
+
+    def set_integrator_hold(self, hold: bool, leak_override: float | None = None):
+        self.pid.set_integrator_hold(hold)
+        self.pid.set_integrator_leak_override(leak_override)
 
     def _sat_frac_from_rpms(self, rpms: np.ndarray) -> float:
         """
@@ -173,6 +185,8 @@ class PIDAgenticController:
         v_ref_ahead,  # kept for API compatibility (unused in this conservative design)
         yaw_des: float = 0.0,
         *,
+        group_pos: np.ndarray | None = None,
+        comm_range_m: float | None = None,
         return_debug: bool = False,
     ):
         dt = 1.0 / float(self.cfg["sim"]["ctrl_hz"])
@@ -189,7 +203,7 @@ class PIDAgenticController:
         p_ref_ahead = np.asarray(p_ref_ahead, dtype=float)
 
         # ============================================
-        # Agentic FEEDFORWARD bias (no measurements)
+        # Agentic bias (closed-loop gating + comm-aware)
         # ============================================
         delta = (p_ref_ahead - p_ref_now).copy()
         delta[2] = 0.0
@@ -200,6 +214,14 @@ class PIDAgenticController:
 
         raw = float(np.clip((delta_xy_norm - d0) / (d1 - d0), 0.0, 1.0))
         a_target = self._smoothstep01(raw)
+
+        # Error-aware gating: if tracking error already large, reduce authority
+        err_xy_norm = float(np.linalg.norm((p_ref_now - cur_pos)[:2]))
+        err_gate = float(self.error_gate_m)
+        err_scale = max(1e-6, float(self.error_scale_m))
+        err_factor = float(np.clip((err_xy_norm - err_gate) / err_scale, 0.0, 1.0))
+        a_target = a_target * (1.0 - err_factor)
+
         authority = self._update_authority(a_target, dt)
 
         # bounded bias
@@ -208,7 +230,28 @@ class PIDAgenticController:
         if shift_xy_norm > float(self.max_ref_shift_m):
             shift[:2] *= float(self.max_ref_shift_m) / (shift_xy_norm + 1e-9)
 
-        p_cmd = p_ref_now + shift
+        # Comm-aware bias: if isolated, pull toward centroid
+        comm_bias = np.zeros(3, dtype=float)
+        if group_pos is not None and comm_range_m is not None and self.comm_bias_m > 0.0:
+            pos_all = np.asarray(group_pos, dtype=float)
+            if pos_all.ndim == 2 and pos_all.shape[1] == 3:
+                n = pos_all.shape[0]
+                nbrs = 0
+                for j in range(n):
+                    if np.allclose(pos_all[j], cur_pos):
+                        continue
+                    d = np.linalg.norm((pos_all[j] - cur_pos)[:2])
+                    if d <= float(comm_range_m):
+                        nbrs += 1
+                if nbrs < self.comm_min_neighbors:
+                    centroid = pos_all.mean(axis=0)
+                    vec = centroid - cur_pos
+                    vec[2] = 0.0
+                    norm = float(np.linalg.norm(vec[:2]))
+                    if norm > 1e-9:
+                        comm_bias[:2] = (vec[:2] / norm) * float(self.comm_bias_m)
+
+        p_cmd = p_ref_now + shift + comm_bias
         bias_norm = float(np.linalg.norm(shift[:2]))
         apply_bias_float = 1.0 if bias_norm > 1e-9 else 0.0
 
@@ -292,6 +335,9 @@ class PIDAgenticController:
 
                 "bias_norm": float(bias_norm),
                 "max_ref_shift_m": float(self.max_ref_shift_m),
+                "err_xy_norm": float(err_xy_norm),
+                "err_factor": float(err_factor),
+                "comm_bias_xy": float(np.linalg.norm(comm_bias[:2])),
 
                 "err_norm_nominal_xy": float(err_norm),
 

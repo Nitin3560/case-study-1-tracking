@@ -120,12 +120,93 @@ def summarize(df: pd.DataFrame, controller_name: str) -> Dict[str, Any]:
         # Agentic interpretability channels (optional)
         "agentic_active_rate": _mean("agentic_active"),
         "agentic_ref_shift_mean": _mean("agentic_ref_shift"),
+        "supervisor_active_rate": _mean("supervisor_active"),
+        "supervisor_mode": _mean("supervisor_mode"),
+        "ref_shift_norm": _mean("ref_shift_norm"),
+        "formation_scale": _mean("formation_scale"),
+        "smooth_alpha": _mean("smooth_alpha"),
+        "int_hold_rate": _mean("int_hold"),
+
+        # Network/task/failure proxies
+        "throughput_ratio": _mean("throughput_ratio"),
+        "latency_proxy": _mean("latency_proxy"),
+        "control_overhead": _mean("control_overhead"),
+        "task_reassign_rate": _mean("task_reassign"),
+        "task_cost_mean": _mean("task_cost_mean"),
+        "alive_ratio": _mean("alive_ratio"),
+        "failed_count": _mean("failed_count"),
     }
 
     # Backward-compatible legacy columns (do not remove unless you update downstream)
     out["mean_err_m"] = mean_nom
     out["max_err_m"] = max_nom
 
+    return out
+
+
+def summarize_windows(df: pd.DataFrame, controller_name: str) -> pd.DataFrame:
+    """
+    Windowed (phase-based) summary. Uses wind_phase if present.
+    Returns per-window mean over time, then averaged over seeds.
+    """
+    if "wind_phase" not in df.columns:
+        return pd.DataFrame()
+
+    # mean per seed within each phase, then average across seeds
+    g = df.groupby(["wind_phase", "seed"])
+    per_seed = g.agg(
+        mean_err_m=("mean_err_m", "mean"),
+        max_err_m=("max_err_m", "max"),
+        formation_err_rel=("formation_err_rel", "mean"),
+        connectivity_rate=("connectivity_rate", "mean"),
+    ).reset_index()
+
+    out = (
+        per_seed
+        .groupby("wind_phase")
+        .agg(
+            mean_err_m=("mean_err_m", "mean"),
+            max_err_m=("max_err_m", "mean"),
+            formation_err_rel=("formation_err_rel", "mean"),
+            connectivity_rate=("connectivity_rate", "mean"),
+        )
+        .reset_index()
+    )
+    out.insert(0, "controller", controller_name)
+    return out
+
+
+def summarize_fixed_bins(df: pd.DataFrame, controller_name: str, bins: list[float]) -> pd.DataFrame:
+    """
+    Fixed time-bin summary. bins is a list of bin edges in seconds.
+    Returns per-bin mean over time, then averaged over seeds.
+    """
+    if "t" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["time_bin"] = pd.cut(df["t"], bins=bins, right=False, include_lowest=True)
+
+    g = df.groupby(["time_bin", "seed"], observed=False)
+    per_seed = g.agg(
+        mean_err_m=("mean_err_m", "mean"),
+        max_err_m=("max_err_m", "max"),
+        formation_err_rel=("formation_err_rel", "mean"),
+        connectivity_rate=("connectivity_rate", "mean"),
+    ).reset_index()
+
+    out = (
+        per_seed
+        .groupby("time_bin", observed=False)
+        .agg(
+            mean_err_m=("mean_err_m", "mean"),
+            max_err_m=("max_err_m", "mean"),
+            formation_err_rel=("formation_err_rel", "mean"),
+            connectivity_rate=("connectivity_rate", "mean"),
+        )
+        .reset_index()
+    )
+    out.insert(0, "controller", controller_name)
     return out
 
 
@@ -275,6 +356,90 @@ def main():
         )
 
     # ------------------------------------------------------------------
+    # Figures: network/task proxies (if present)
+    # ------------------------------------------------------------------
+    if (
+        "throughput_ratio" in open_df.columns
+        and "throughput_ratio" in pid_df.columns
+        and "throughput_ratio" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "throughput_ratio",
+            "Open-loop throughput ratio (mean ± 95% CI)",
+            figs / "openloop_throughput_ratio.png",
+            ylabel="throughput_ratio",
+        )
+        plot_curve(
+            pid_df,
+            "throughput_ratio",
+            "PID throughput ratio (mean ± 95% CI)",
+            figs / "pid_throughput_ratio.png",
+            ylabel="throughput_ratio",
+        )
+        plot_curve(
+            ag_df,
+            "throughput_ratio",
+            "Agentic throughput ratio (mean ± 95% CI)",
+            figs / "agentic_throughput_ratio.png",
+            ylabel="throughput_ratio",
+        )
+
+    if (
+        "latency_proxy" in open_df.columns
+        and "latency_proxy" in pid_df.columns
+        and "latency_proxy" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "latency_proxy",
+            "Open-loop latency proxy (mean ± 95% CI)",
+            figs / "openloop_latency_proxy.png",
+            ylabel="latency_proxy",
+        )
+        plot_curve(
+            pid_df,
+            "latency_proxy",
+            "PID latency proxy (mean ± 95% CI)",
+            figs / "pid_latency_proxy.png",
+            ylabel="latency_proxy",
+        )
+        plot_curve(
+            ag_df,
+            "latency_proxy",
+            "Agentic latency proxy (mean ± 95% CI)",
+            figs / "agentic_latency_proxy.png",
+            ylabel="latency_proxy",
+        )
+
+    if (
+        "control_overhead" in open_df.columns
+        and "control_overhead" in pid_df.columns
+        and "control_overhead" in ag_df.columns
+    ):
+        plot_curve(
+            open_df,
+            "control_overhead",
+            "Open-loop control overhead (mean ± 95% CI)",
+            figs / "openloop_control_overhead.png",
+            ylabel="control_overhead",
+        )
+        plot_curve(
+            pid_df,
+            "control_overhead",
+            "PID control overhead (mean ± 95% CI)",
+            figs / "pid_control_overhead.png",
+            ylabel="control_overhead",
+        )
+        plot_curve(
+            ag_df,
+            "control_overhead",
+            "Agentic control overhead (mean ± 95% CI)",
+            figs / "agentic_control_overhead.png",
+            ylabel="control_overhead",
+        )
+
+    # ------------------------------------------------------------------
     # Summary CSV (explicit semantics)
     # ------------------------------------------------------------------
     summary_rows = [
@@ -286,6 +451,31 @@ def main():
 
     summary_path = Path("outputs") / "summary.csv"
     summary.to_csv(summary_path, index=False)
+
+    # Windowed summary (phase-based)
+    win_rows = []
+    for ctrl_name, dfc in [("openloop", open_df), ("pid", pid_df), ("agentic", ag_df)]:
+        win = summarize_windows(dfc, ctrl_name)
+        if not win.empty:
+            win_rows.append(win)
+    if win_rows:
+        win_df = pd.concat(win_rows, ignore_index=True)
+        win_path = Path("outputs") / "summary_windows.csv"
+        win_df.to_csv(win_path, index=False)
+        print(f"Saved: {win_path.resolve()}")
+
+    # Fixed-bin summary (time bins)
+    bins = [0.0, 20.0, 40.0, 60.0, 80.0, 1e9]
+    bin_rows = []
+    for ctrl_name, dfc in [("openloop", open_df), ("pid", pid_df), ("agentic", ag_df)]:
+        bdf = summarize_fixed_bins(dfc, ctrl_name, bins)
+        if not bdf.empty:
+            bin_rows.append(bdf)
+    if bin_rows:
+        bin_df = pd.concat(bin_rows, ignore_index=True)
+        bin_path = Path("outputs") / "summary_bins.csv"
+        bin_df.to_csv(bin_path, index=False)
+        print(f"Saved: {bin_path.resolve()}")
 
     print(f"Saved: {summary_path.resolve()}")
     print(f"Saved figures in: {figs.resolve()}")

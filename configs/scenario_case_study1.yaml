@@ -1,0 +1,138 @@
+sim:
+  drone_model: "cf2x"
+  physics: "pyb"
+  gui: false
+
+  # Physics & control
+  freq_hz: 240
+  ctrl_hz: 48
+  duration_s: 55.0
+  num_drones: 4
+  seed: 1
+  debug_obs: false
+
+  # Actuator limits (used for saturation-aware PID)
+  rpm_min: 0
+  rpm_max: 18000
+
+
+trajectory:
+  type: "circle"
+  radius_m: 8.0
+  period_s: 18.0
+  altitude_m: 2.0
+  center_xy: [0.0, 0.0]
+
+
+formation:
+  type: "square"
+  spacing_m: 2.0
+
+
+disturbance:
+  wind:
+    mode: "phased"
+    phases:
+    - t0_s: 0.0
+      t1_s: 15.0
+      constant_force_n: [0.05, 0.0, 0.0]
+      gust_force_n_max: 0.09
+      gust_interval_s: [0.8, 1.6]
+      gust_duration_s: [0.4, 0.8]
+
+    - t0_s: 15.0
+      t1_s: 40.0
+      constant_force_n: [0.08, 0.00, 0.0]
+      gust_force_n_max: 0.14
+      gust_interval_s: [0.8, 1.8]
+      gust_duration_s: [0.6, 1.2]
+
+    - t0_s: 40.0
+      t1_s: 55.0
+      constant_force_n: [0.06, 0.00, 0.0]
+      gust_force_n_max: 0.11
+      gust_interval_s: [1.6, 3.0]
+      gust_duration_s: [0.5, 1.1]
+
+  gps_drift:
+    enabled: True
+    random_walk_std_m_per_s: 0.02
+    noise_std_m: 0.04
+
+
+metrics:
+  steady_state_after_s: 40.0
+
+
+network:
+  num_flows: 6
+  demand_range: [0.5, 2.0]
+
+
+tasks:
+  reassign_margin_m: 0.5
+
+
+controllers:
+
+  sensing:
+    openloop: "gps"
+    pid: "gps"
+    agentic: "gps"
+
+  openloop:
+    openloop_delay_s: 0.2
+
+  pid:
+    kp: 1.15
+    kd: 0.50
+    ki: 0.08
+    v_max: 5.8
+
+    # Integrator hysteresis gates (matches pid_core.py)
+    int_gate_on_err_m: 2.0
+    int_gate_off_err_m: 3.0
+    int_gate_on_vel_mps: 4.0
+    int_gate_off_vel_mps: 5.0
+
+    int_leak: 0.995
+    int_clamp: 1.5
+
+    # D-term filtering (matches pid_core.py)
+    d_mode: "vel"
+    d_tau_s: 0.05
+
+    int_sat_hold: false
+    int_sat_leak: 1.0
+
+  agentic:
+    # Time horizon: low-bandwidth supervisory layer
+    lookahead_s: 1.0
+    error_thresh_m: 1.3
+    max_ref_shift_m: 0.20
+    authority_alpha: 0.0
+    authority_ramp_mult: 2.5
+    error_gate_m: 0.6
+    error_scale_m: 1.5
+    comm_bias_m: 0.18
+    comm_min_neighbors: 1
+    rpm_eps: 1e-3
+
+    supervisor:
+      hz: 4.0
+      hold_s: 1.2
+      err_thresh_m: 1.4
+      err_recover_slope_mps: 0.12
+      conn_thresh: 0.7
+      form_thresh: 1.15
+      ref_shift_rate_mps: 0.10
+      ref_shift_max_m: 0.20
+      smooth_alpha_active: 0.5
+      formation_scale_min: 0.9
+      formation_scale_max: 1.15
+      sat_hold_thresh: 0.55
+      int_leak_override: 0.985
+      drift_disable_phase_ge: 2
+      ref_shift_decay_mps: 0.05
+      err_hard_m: 3.5
+      hard_hold_s: 1.5

@@ -79,6 +79,8 @@ class PIDCore:
 
         self._sat_frac = 0.0
         self._int_enabled = False
+        self._int_hold = False
+        self._int_leak_override = None
 
         self._mask = np.asarray(cfg.axis_mask, float)
 
@@ -89,12 +91,26 @@ class PIDCore:
         self.v_filt[:] = 0.0
         self._sat_frac = 0.0
         self._int_enabled = False
+        self._int_hold = False
+        self._int_leak_override = None
 
     def set_saturation(self, saturated: bool | float):
         if isinstance(saturated, (float, np.floating)):
             self._sat_frac = float(_clamp(saturated, 0.0, 1.0))
         else:
             self._sat_frac = 1.0 if saturated else 0.0
+
+    def set_integrator_hold(self, hold: bool):
+        self._int_hold = bool(hold)
+
+    def set_integrator_leak_override(self, leak: float | None):
+        if leak is None:
+            self._int_leak_override = None
+        else:
+            self._int_leak_override = float(leak)
+
+    def reset_integrator(self):
+        self.e_int[:] = 0.0
 
     def _alpha(self, tau: float, dt: float) -> float:
         if tau <= 0:
@@ -150,6 +166,7 @@ class PIDCore:
             self._int_enabled
             and (not sat_now or not self.cfg.int_sat_hold)
             and self.cfg.ki > 0
+            and not self._int_hold
         )
 
         # Integral scaling
@@ -165,7 +182,8 @@ class PIDCore:
             else:
                 self.e_int += e * dt * int_scale
         else:
-            leak = self.cfg.int_leak * (self.cfg.int_sat_leak if sat_now else 1.0)
+            leak = self._int_leak_override if self._int_leak_override is not None else self.cfg.int_leak
+            leak = leak * (self.cfg.int_sat_leak if sat_now else 1.0)
             self.e_int *= leak
 
         # Clamp integral

@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import yaml
 
 
 def parse_args():
@@ -17,6 +18,11 @@ def parse_args():
     ap.add_argument("--config", required=True)
     ap.add_argument("--seeds", nargs="+", type=int, required=True)
     return ap.parse_args()
+
+
+def load_cfg(path: str) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
 
 
 def aggregate(controller: str, seeds: List[int]) -> pd.DataFrame:
@@ -135,6 +141,8 @@ def summarize(df: pd.DataFrame, controller_name: str) -> Dict[str, Any]:
         "task_cost_mean": _mean("task_cost_mean"),
         "alive_ratio": _mean("alive_ratio"),
         "failed_count": _mean("failed_count"),
+        "task_completion_proxy": _mean("task_completion_proxy"),
+        "system_utility": _mean("system_utility"),
     }
 
     # Backward-compatible legacy columns (do not remove unless you update downstream)
@@ -159,6 +167,8 @@ def summarize_windows(df: pd.DataFrame, controller_name: str) -> pd.DataFrame:
         max_err_m=("max_err_m", "max"),
         formation_err_rel=("formation_err_rel", "mean"),
         connectivity_rate=("connectivity_rate", "mean"),
+        task_completion_proxy=("task_completion_proxy", "mean"),
+        system_utility=("system_utility", "mean"),
     ).reset_index()
 
     out = (
@@ -169,6 +179,8 @@ def summarize_windows(df: pd.DataFrame, controller_name: str) -> pd.DataFrame:
             max_err_m=("max_err_m", "mean"),
             formation_err_rel=("formation_err_rel", "mean"),
             connectivity_rate=("connectivity_rate", "mean"),
+            task_completion_proxy=("task_completion_proxy", "mean"),
+            system_utility=("system_utility", "mean"),
         )
         .reset_index()
     )
@@ -193,6 +205,8 @@ def summarize_fixed_bins(df: pd.DataFrame, controller_name: str, bins: list[floa
         max_err_m=("max_err_m", "max"),
         formation_err_rel=("formation_err_rel", "mean"),
         connectivity_rate=("connectivity_rate", "mean"),
+        task_completion_proxy=("task_completion_proxy", "mean"),
+        system_utility=("system_utility", "mean"),
     ).reset_index()
 
     out = (
@@ -203,6 +217,8 @@ def summarize_fixed_bins(df: pd.DataFrame, controller_name: str, bins: list[floa
             max_err_m=("max_err_m", "mean"),
             formation_err_rel=("formation_err_rel", "mean"),
             connectivity_rate=("connectivity_rate", "mean"),
+            task_completion_proxy=("task_completion_proxy", "mean"),
+            system_utility=("system_utility", "mean"),
         )
         .reset_index()
     )
@@ -210,9 +226,241 @@ def summarize_fixed_bins(df: pd.DataFrame, controller_name: str, bins: list[floa
     return out
 
 
+def _first_fault_t0(cfg: Dict[str, Any]) -> float | None:
+    faults = (cfg.get("faults", {}) or {})
+    events = faults.get("events", []) or []
+    if not events:
+        return None
+    t0_vals = []
+    for ev in events:
+        try:
+            t0_vals.append(float(ev.get("t0_s")))
+        except Exception:
+            continue
+    return min(t0_vals) if t0_vals else None
+
+
+def _first_fault_event(cfg: Dict[str, Any]) -> Dict[str, Any] | None:
+    faults = (cfg.get("faults", {}) or {})
+    events = faults.get("events", []) or []
+    if not events:
+        return None
+    valid = []
+    for ev in events:
+        try:
+            t0 = float(ev.get("t0_s"))
+            valid.append((t0, ev))
+        except Exception:
+            continue
+    if not valid:
+        return None
+    valid.sort(key=lambda x: x[0])
+    return valid[0][1]
+
+
+def _pct_change(new: float, base: float) -> float:
+    if np.isnan(new) or np.isnan(base) or abs(base) < 1e-9:
+        return float("nan")
+    return float((new - base) / base * 100.0)
+
+
+def _abs_degradation_pct(new: float, base: float) -> float:
+    if np.isnan(new) or np.isnan(base) or abs(base) < 1e-9:
+        return float("nan")
+    return float((abs(new) - abs(base)) / abs(base) * 100.0)
+
+
+def _build_fault_degradation_table(fault_df: pd.DataFrame) -> pd.DataFrame:
+    out = fault_df.copy()
+    out["err_fault_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["mean_err_fault"], out["mean_err_pre"])
+    ]
+    out["err_post_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["mean_err_post"], out["mean_err_pre"])
+    ]
+    out["conn_fault_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["connectivity_fault"], out["connectivity_pre"])
+    ]
+    out["conn_post_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["connectivity_post"], out["connectivity_pre"])
+    ]
+    out["task_fault_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["task_completion_fault"], out["task_completion_pre"])
+    ]
+    out["task_post_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["task_completion_post"], out["task_completion_pre"])
+    ]
+    out["utility_fault_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["system_utility_fault"], out["system_utility_pre"])
+    ]
+    out["utility_post_vs_pre_pct"] = [
+        _pct_change(n, b) for n, b in zip(out["system_utility_post"], out["system_utility_pre"])
+    ]
+    # Utility is often negative; these columns are sign-safe for reporting degradation.
+    out["utility_fault_delta"] = [
+        float(n - b) if not (np.isnan(n) or np.isnan(b)) else float("nan")
+        for n, b in zip(out["system_utility_fault"], out["system_utility_pre"])
+    ]
+    out["utility_post_delta"] = [
+        float(n - b) if not (np.isnan(n) or np.isnan(b)) else float("nan")
+        for n, b in zip(out["system_utility_post"], out["system_utility_pre"])
+    ]
+    out["utility_fault_abs_degradation_pct"] = [
+        _abs_degradation_pct(n, b) for n, b in zip(out["system_utility_fault"], out["system_utility_pre"])
+    ]
+    out["utility_post_abs_degradation_pct"] = [
+        _abs_degradation_pct(n, b) for n, b in zip(out["system_utility_post"], out["system_utility_pre"])
+    ]
+    return out
+
+
+def _plot_fault_timeline(
+    open_df: pd.DataFrame,
+    pid_df: pd.DataFrame,
+    ag_df: pd.DataFrame,
+    outpath: Path,
+    t0: float,
+    t1: float | None = None,
+) -> None:
+    plt.figure(figsize=(9, 6))
+    ax1 = plt.subplot(2, 1, 1)
+    for name, df, color in [
+        ("openloop", open_df, "tab:blue"),
+        ("pid", pid_df, "tab:orange"),
+        ("agentic", ag_df, "tab:green"),
+    ]:
+        mean, _ = mean_ci_over_seeds(df, "mean_err_m")
+        ax1.plot(mean.index.values, mean.values, label=name, color=color)
+    ax1.axvline(float(t0), linestyle="--", color="k", linewidth=1.0)
+    if t1 is not None:
+        ax1.axvspan(float(t0), float(t1), color="gray", alpha=0.15)
+    ax1.set_ylabel("Mean Error (m)")
+    ax1.set_title("Fault Timeline: Tracking Error")
+    ax1.legend(loc="upper left")
+
+    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+    for name, df, color in [
+        ("openloop", open_df, "tab:blue"),
+        ("pid", pid_df, "tab:orange"),
+        ("agentic", ag_df, "tab:green"),
+    ]:
+        mean, _ = mean_ci_over_seeds(df, "connectivity_rate")
+        ax2.plot(mean.index.values, mean.values, label=name, color=color)
+    ax2.axvline(float(t0), linestyle="--", color="k", linewidth=1.0)
+    if t1 is not None:
+        ax2.axvspan(float(t0), float(t1), color="gray", alpha=0.15)
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Connectivity")
+    ax2.set_title("Fault Timeline: Connectivity")
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def _recovery_time(df: pd.DataFrame, t0: float, thr_mult: float = 1.5, hold_s: float = 1.0) -> float:
+    if "t" not in df.columns or "mean_err_m" not in df.columns:
+        return float("nan")
+    pre = df[(df["t"] >= t0 - 5.0) & (df["t"] < t0)]["mean_err_m"]
+    if pre.empty:
+        return float("nan")
+    thr = float(pre.mean()) * float(thr_mult)
+    ts = df["t"].to_numpy()
+    es = df["mean_err_m"].to_numpy()
+    for i in range(len(ts)):
+        if ts[i] < t0:
+            continue
+        t1 = ts[i] + hold_s
+        j = int(np.searchsorted(ts, t1, side="right"))
+        if j <= i:
+            continue
+        if np.all(es[i:j] <= thr):
+            return float(ts[i] - t0)
+    return float("nan")
+
+
+def summarize_fault_windows(df: pd.DataFrame, controller_name: str, t0: float) -> pd.DataFrame:
+    if "t" not in df.columns:
+        return pd.DataFrame()
+    bins = [t0 - 5.0, t0, t0 + 5.0, t0 + 15.0]
+    labels = ["pre", "fault", "post"]
+    d = df.copy()
+    d["fault_window"] = pd.cut(d["t"], bins=bins, labels=labels, right=False, include_lowest=True)
+    d = d[d["fault_window"].notna()]
+    if d.empty:
+        return pd.DataFrame()
+    g = d.groupby(["fault_window", "seed"], observed=False)
+    per_seed = g.agg(
+        mean_err_m=("mean_err_m", "mean"),
+        max_err_m=("max_err_m", "max"),
+        formation_err_rel=("formation_err_rel", "mean"),
+        connectivity_rate=("connectivity_rate", "mean"),
+        task_completion_proxy=("task_completion_proxy", "mean"),
+        system_utility=("system_utility", "mean"),
+    ).reset_index()
+    out = (
+        per_seed
+        .groupby("fault_window", observed=False)
+        .agg(
+            mean_err_m=("mean_err_m", "mean"),
+            max_err_m=("max_err_m", "mean"),
+            formation_err_rel=("formation_err_rel", "mean"),
+            connectivity_rate=("connectivity_rate", "mean"),
+            task_completion_proxy=("task_completion_proxy", "mean"),
+            system_utility=("system_utility", "mean"),
+        )
+        .reset_index()
+    )
+    out.insert(0, "controller", controller_name)
+    return out
+
+
+def summarize_faults(df: pd.DataFrame, controller_name: str, t0: float) -> Dict[str, Any]:
+    def _seg_mean(t_start: float, t_end: float, col: str = "mean_err_m") -> float:
+        seg = df[(df["t"] >= t_start) & (df["t"] < t_end)]
+        if seg.empty or col not in seg.columns:
+            return float("nan")
+        return float(seg[col].mean())
+
+    pre = _seg_mean(t0 - 5.0, t0)
+    fault = _seg_mean(t0, t0 + 5.0)
+    post = _seg_mean(t0 + 5.0, t0 + 15.0)
+    pre_conn = _seg_mean(t0 - 5.0, t0, "connectivity_rate")
+    fault_conn = _seg_mean(t0, t0 + 5.0, "connectivity_rate")
+    post_conn = _seg_mean(t0 + 5.0, t0 + 15.0, "connectivity_rate")
+    pre_task = _seg_mean(t0 - 5.0, t0, "task_completion_proxy")
+    fault_task = _seg_mean(t0, t0 + 5.0, "task_completion_proxy")
+    post_task = _seg_mean(t0 + 5.0, t0 + 15.0, "task_completion_proxy")
+    pre_util = _seg_mean(t0 - 5.0, t0, "system_utility")
+    fault_util = _seg_mean(t0, t0 + 5.0, "system_utility")
+    post_util = _seg_mean(t0 + 5.0, t0 + 15.0, "system_utility")
+    peak_fault = float(df[(df["t"] >= t0) & (df["t"] < t0 + 5.0)]["max_err_m"].max())
+    rec = _recovery_time(df, t0=t0, thr_mult=1.5, hold_s=1.0)
+    return {
+        "controller": controller_name,
+        "fault_t0_s": float(t0),
+        "mean_err_pre": pre,
+        "mean_err_fault": fault,
+        "mean_err_post": post,
+        "max_err_fault": peak_fault,
+        "recovery_time_s": rec,
+        "connectivity_pre": pre_conn,
+        "connectivity_fault": fault_conn,
+        "connectivity_post": post_conn,
+        "task_completion_pre": pre_task,
+        "task_completion_fault": fault_task,
+        "task_completion_post": post_task,
+        "system_utility_pre": pre_util,
+        "system_utility_fault": fault_util,
+        "system_utility_post": post_util,
+    }
+
+
 def main():
     args = parse_args()
     seeds = args.seeds
+    cfg = load_cfg(args.config)
 
     # Ensure output dirs exist
     Path("outputs/csv").mkdir(parents=True, exist_ok=True)
@@ -476,6 +724,46 @@ def main():
         bin_path = Path("outputs") / "summary_bins.csv"
         bin_df.to_csv(bin_path, index=False)
         print(f"Saved: {bin_path.resolve()}")
+
+    # Fault-centered summaries (if fault events exist in config)
+    fault_event = _first_fault_event(cfg)
+    fault_t0 = _first_fault_t0(cfg)
+    if fault_t0 is not None:
+        fault_rows = [
+            summarize_faults(open_df, "openloop", fault_t0),
+            summarize_faults(pid_df, "pid", fault_t0),
+            summarize_faults(ag_df, "agentic", fault_t0),
+        ]
+        fault_df = pd.DataFrame(fault_rows)
+        fault_path = Path("outputs") / "summary_faults.csv"
+        fault_df.to_csv(fault_path, index=False)
+        print(f"Saved: {fault_path.resolve()}")
+
+        fw_rows = []
+        for ctrl_name, dfc in [("openloop", open_df), ("pid", pid_df), ("agentic", ag_df)]:
+            fw = summarize_fault_windows(dfc, ctrl_name, fault_t0)
+            if not fw.empty:
+                fw_rows.append(fw)
+        if fw_rows:
+            fw_df = pd.concat(fw_rows, ignore_index=True)
+            fw_path = Path("outputs") / "summary_fault_windows.csv"
+            fw_df.to_csv(fw_path, index=False)
+            print(f"Saved: {fw_path.resolve()}")
+
+        degr_df = _build_fault_degradation_table(fault_df)
+        degr_path = Path("outputs") / "summary_fault_degradation.csv"
+        degr_df.to_csv(degr_path, index=False)
+        print(f"Saved: {degr_path.resolve()}")
+
+        t1 = None
+        if fault_event is not None and fault_event.get("t1_s", None) is not None:
+            try:
+                t1 = float(fault_event.get("t1_s"))
+            except Exception:
+                t1 = None
+        timeline_path = Path("outputs/figs") / "fault_timeline_error_connectivity.png"
+        _plot_fault_timeline(open_df, pid_df, ag_df, timeline_path, t0=float(fault_t0), t1=t1)
+        print(f"Saved: {timeline_path.resolve()}")
 
     print(f"Saved: {summary_path.resolve()}")
     print(f"Saved figures in: {figs.resolve()}")

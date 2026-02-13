@@ -91,6 +91,7 @@ class PIDAgenticController:
         self.authority_alpha = float(ag_cfg.get("authority_alpha", 0.0))
         self._authority = 0.0
         self.authority_max_rate = float(ag_cfg.get("authority_max_rate", 0.0))
+        self.authority_scale = 1.0
 
         self.v_cmd_limit_mps = ag_cfg.get("v_cmd_limit_mps", None)
         if self.v_cmd_limit_mps is not None:
@@ -128,6 +129,9 @@ class PIDAgenticController:
         self.pid.set_integrator_hold(hold)
         self.pid.set_integrator_leak_override(leak_override)
 
+    def set_authority_scale(self, scale: float):
+        self.authority_scale = float(np.clip(scale, 0.0, 1.0))
+
     def _sat_frac_from_rpms(self, rpms: np.ndarray) -> float:
         """
         Graded saturation fraction in [0,1] based on proximity to rpm bounds.
@@ -161,12 +165,14 @@ class PIDAgenticController:
         a_target = float(np.clip(a_target, 0.0, 1.0))
 
         # Stateless by default
-        if self.authority_alpha <= 0.0:
+        alpha_eff = float(np.clip(self.authority_alpha * self.authority_scale, 0.0, 1.0))
+
+        if alpha_eff <= 0.0:
             self._authority = a_target
             return a_target
 
         # EMA reference filter
-        a_next = self.authority_alpha * float(self._authority) + (1.0 - self.authority_alpha) * a_target
+        a_next = alpha_eff * float(self._authority) + (1.0 - alpha_eff) * a_target
 
         # Optional rate limit
         if self.authority_max_rate and self.authority_max_rate > 0.0 and dt > 0.0:

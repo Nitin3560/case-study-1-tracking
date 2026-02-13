@@ -26,6 +26,7 @@ from .controllers.openloop import OpenLoopController
 from .controllers.pid import PIDController
 from .controllers.pid_agentic import PIDAgenticController
 from .controllers.agentic_supervisor import AgenticSupervisor
+from .faults import FaultInjector
 
 
 def _load_cfg(path: str) -> Dict[str, Any]:
@@ -167,10 +168,14 @@ def main():
     ctrl_decim = max(1, int(round(dt_ctrl / dt_sim)))
 
     rows = []
+    fault_rows = []
     comm_range = float(sim_cfg.get("comm_range_m", 10.0))
 
     agentic_cfg = (cfg.get("controllers", {}) or {}).get("agentic", {}) or {}
     lookahead_s = float(agentic_cfg.get("lookahead_s", 0.5))
+    authority_conn_gate = float(agentic_cfg.get("authority_connectivity_gate", 0.6))
+    authority_conn_scale = float(agentic_cfg.get("authority_connectivity_scale", 0.6))
+    authority_untrusted_scale = float(agentic_cfg.get("authority_untrusted_scale", 0.2))
 
     rng = np.random.default_rng(int(args.seed))
     demand = _build_demand(n, cfg, rng)
@@ -178,6 +183,11 @@ def main():
     task_cfg = (cfg.get("tasks", {}) or {})
     reassign_margin_m = float(task_cfg.get("reassign_margin_m", 0.5))
     assign_prev = list(range(n))  # mapping drone -> task index
+    metrics_cfg = (cfg.get("metrics", {}) or {})
+    task_completion_err_thresh_m = float(metrics_cfg.get("task_completion_err_thresh_m", 2.0))
+    utility_lambda_form = float(metrics_cfg.get("utility_lambda_form", 1.0))
+    utility_bonus_conn = float(metrics_cfg.get("utility_bonus_conn", 5.0))
+    utility_penalty_failed = float(metrics_cfg.get("utility_penalty_failed", 5.0))
 
     # Agentic supervisor (slow, selective, priority modes)
     supervisor = AgenticSupervisor(cfg) if args.controller == "agentic" else None
@@ -188,11 +198,19 @@ def main():
     supervisor_active = 0.0
     supervisor_mode = 0.0
     last_sat_mean = 0.0
+    fault = FaultInjector(cfg.get("faults", {}))
 
     for k in tqdm(range(steps)):
         t = k * dt_sim
         dist.apply_wind(env, t)
-        failed = dist.failed_drones(t, n)
+        failed_dist = dist.failed_drones(t, n)
+        offline_mask = fault.offline_mask(n, t)
+        sensor_corrupt_mask = fault.sensor_corrupt_mask(n, t)
+        failed = {i: bool(failed_dist.get(i, False) or offline_mask[i]) for i in range(n)}
+        active_mask = np.array([not failed.get(i, False) for i in range(n)], dtype=bool)
+        trusted_mask = active_mask & (~sensor_corrupt_mask)
+        comm_scale = fault.comm_range_scale(t)
+        comm_range_eff = float(comm_range * comm_scale)
 
         if (k % ctrl_decim) != 0:
             obs, *_ = env.step(action)
@@ -203,6 +221,9 @@ def main():
         for i in range(n):
             true_pos = obs[i][0:3]
             obs_meas[i][0:3] = dist.gps_measurement(true_pos=true_pos, t=t, dt=dt_sim)
+            pos_used, vel_used = fault.apply_sensing(i, obs_meas[i][0:3], obs_meas[i][10:13], t)
+            obs_meas[i][0:3] = pos_used
+            obs_meas[i][10:13] = vel_used
 
         sense_cfg = cfg.get("controllers", {}).get("sensing", {}) or {}
         mode = sense_cfg.get(args.controller, "gps").lower()
@@ -212,6 +233,16 @@ def main():
         if args.controller == "agentic" and agentic is not None:
             leak_override = supervisor.integrator_leak_override() if supervisor is not None else None
             agentic.set_integrator_hold(bool(int_hold), leak_override=leak_override)
+            trusted_frac = float(np.sum(trusted_mask)) / float(max(1, np.sum(active_mask)))
+            authority_scale = 1.0
+            if trusted_frac < 1.0:
+                authority_scale *= authority_untrusted_scale
+            if np.any(active_mask):
+                pos_active = np.stack([obs_ctrl[j][0:3] for j in range(n) if active_mask[j]], axis=0)
+                conn_active = _safe_connectivity(pos_active, comm_range_eff) if pos_active.shape[0] > 0 else 0.0
+                if conn_active < authority_conn_gate:
+                    authority_scale *= authority_conn_scale
+            agentic.set_authority_scale(authority_scale)
 
         # Nominal trajectory (now + lookahead)
         p_now, v_now = p_ref(cfg, t)
@@ -230,15 +261,16 @@ def main():
 
         # Apply agentic supervisor adjustments (slow, bounded)
         if args.controller == "agentic":
-            p_now_eff = p_now + ref_shift
-            p_ahead_eff = p_now_eff + smooth_alpha * (p_ahead - p_now)
             v_now_eff = smooth_alpha * v_now
             v_ahead_eff = smooth_alpha * v_ahead
             offs_scaled = offs * formation_scale
             for i in range(n):
-                p_des_now[i] = p_now_eff + offs_scaled[i]
+                shift_i = ref_shift if trusted_mask[i] else np.zeros(3, dtype=float)
+                p_now_eff_i = p_now + shift_i
+                p_ahead_eff_i = p_now_eff_i + smooth_alpha * (p_ahead - p_now)
+                p_des_now[i] = p_now_eff_i + offs_scaled[i]
                 v_des_now[i] = v_now_eff
-                p_des_ahead[i] = p_ahead_eff + offs_scaled[i]
+                p_des_ahead[i] = p_ahead_eff_i + offs_scaled[i]
                 v_des_ahead[i] = v_ahead_eff
 
         # -------------------------------
@@ -342,6 +374,12 @@ def main():
             assert agentic is not None
             applied = []
             shifts = []
+            if np.any(trusted_mask):
+                group_pos_active = np.stack([obs_ctrl[j][0:3] for j in range(n) if trusted_mask[j]], axis=0)
+            elif np.any(active_mask):
+                group_pos_active = np.stack([obs_ctrl[j][0:3] for j in range(n) if active_mask[j]], axis=0)
+            else:
+                group_pos_active = None
 
             for i in range(n):
                 if failed.get(i, False):
@@ -363,8 +401,8 @@ def main():
                     p_ref_ahead=p_des_ahead[t_idx],
                     v_ref_ahead=v_des_ahead[t_idx],
                     yaw_des=0.0,
-                    group_pos=np.stack([obs_ctrl[j][0:3] for j in range(n)], axis=0),
-                    comm_range_m=comm_range,
+                    group_pos=group_pos_active,
+                    comm_range_m=comm_range_eff,
                 )
 
                 action[i] = rpms
@@ -378,6 +416,16 @@ def main():
 
             agentic_active_step = float(np.mean(applied)) if applied else 0.0
             agentic_ref_shift_step = float(np.mean(shifts)) if shifts else 0.0
+
+        # Apply dropout/no-control overrides after controller output
+        dropped_agents = []
+        sensor_bad_agents = []
+        for i in range(n):
+            action[i], meta = fault.apply_control(i, action[i], t)
+            if meta.get("dropout_active", False):
+                dropped_agents.append(i)
+            if fault.agent_has_sensor_fault(i, t):
+                sensor_bad_agents.append(i)
 
         # -------------------------------
         # Metrics (truth-based)
@@ -399,11 +447,13 @@ def main():
             max_err_nom = float(np.max(err_nom_xy[alive_idx]))
             mean_err_cmd = float(np.mean(err_cmd_xy[alive_idx]))
             max_err_cmd = float(np.max(err_cmd_xy[alive_idx]))
+            task_completion_proxy = float(np.mean(err_nom_xy[alive_idx] <= task_completion_err_thresh_m))
         else:
             mean_err_nom = float("nan")
             max_err_nom = float("nan")
             mean_err_cmd = float("nan")
             max_err_cmd = float("nan")
+            task_completion_proxy = float("nan")
 
         sat_frac_step = float(np.nanmean(sat_fracs)) if len(sat_fracs) else float("nan")
         if np.isfinite(sat_frac_step):
@@ -417,11 +467,20 @@ def main():
             offs_assigned = offs_assigned * formation_scale
         offs_alive = offs_assigned[alive_idx] if alive_idx.size > 0 else offs_assigned
 
-        adj = adjacency_matrix(pos_alive, comm_range_m=comm_range, use_3d=False)
+        adj = adjacency_matrix(pos_alive, comm_range_m=comm_range_eff, use_3d=False)
         demand_alive = demand[np.ix_(alive_idx, alive_idx)] if alive_idx.size > 0 else demand
         tp_ratio = throughput_ratio(adj, demand_alive) if alive_idx.size > 1 else 0.0
         lat_proxy = avg_shortest_path(adj) if alive_idx.size > 1 else 0.0
         ctrl_over = control_overhead_ratio(adj) if alive_idx.size > 1 else 0.0
+        conn_rate = _safe_connectivity(pos_alive, comm_range_eff)
+        form_err_rel = float(formation_error_relative(pos_alive, offs_alive))
+        alive_ratio = float(np.mean(alive_mask)) if alive_mask.size > 0 else 0.0
+        system_utility = (
+            -mean_err_nom
+            - utility_lambda_form * form_err_rel
+            + utility_bonus_conn * conn_rate
+            - utility_penalty_failed * (1.0 - alive_ratio)
+        )
 
         rows.append(
             {
@@ -438,8 +497,8 @@ def main():
                 "mean_err_cmd_m": mean_err_cmd,
                 "max_err_cmd_m": max_err_cmd,
 
-                "formation_err_rel": float(formation_error_relative(pos_alive, offs_alive)),
-                "connectivity_rate": _safe_connectivity(pos_alive, comm_range),
+                "formation_err_rel": form_err_rel,
+                "connectivity_rate": conn_rate,
 
                 "throughput_ratio": float(tp_ratio),
                 "latency_proxy": float(lat_proxy),
@@ -449,7 +508,12 @@ def main():
                 "task_cost_mean": float(np.mean(err_nom_xy[alive_idx])) if alive_idx.size > 0 else float("nan"),
 
                 "failed_count": float(np.sum(~alive_mask)),
-                "alive_ratio": float(np.mean(alive_mask)) if alive_mask.size > 0 else 0.0,
+                "alive_ratio": alive_ratio,
+                "task_completion_proxy": task_completion_proxy,
+                "system_utility": float(system_utility),
+                "fault_comm_scale": float(comm_scale),
+                "fault_dropout_count": float(len(dropped_agents)),
+                "fault_sensor_count": float(len(sensor_bad_agents)),
 
                 "agentic_active": float(agentic_active_step),
                 "agentic_ref_shift": float(agentic_ref_shift_step),
@@ -470,14 +534,20 @@ def main():
         # Supervisor update (slow layer)
         # -------------------------------
         if args.controller == "agentic" and supervisor is not None and supervisor.should_tick(dt_ctrl):
+            pos_sup = pos_true[alive_idx] if alive_idx.size > 0 else pos_true
+            offs_sup = offs_assigned[alive_idx] if alive_idx.size > 0 else offs_assigned
             state = supervisor.step(
                 dt_ctrl=dt_ctrl,
-                pos_true=pos_true,
+                pos_true=pos_sup,
                 p_ref_now=p_now,
-                formation_err=float(formation_error_relative(pos_true, offs)),
-                connectivity_rate=float(_safe_connectivity(pos_true, comm_range)),
+                formation_err=float(formation_error_relative(pos_sup, offs_sup)),
+                connectivity_rate=float(_safe_connectivity(pos_sup, comm_range_eff)),
                 sat_mean=float(last_sat_mean),
                 phase_id=int(_wind_phase_id(cfg, t)),
+                comm_scale=float(comm_scale),
+                active_mask=active_mask[alive_idx] if alive_idx.size > 0 else active_mask,
+                trusted_mask=trusted_mask[alive_idx] if alive_idx.size > 0 else trusted_mask,
+                sensor_corrupt_mask=sensor_corrupt_mask[alive_idx] if alive_idx.size > 0 else sensor_corrupt_mask,
             )
             ref_shift = state.ref_shift
             formation_scale = state.formation_scale
@@ -486,9 +556,25 @@ def main():
             supervisor_active = float(state.supervisor_active)
             supervisor_mode = float(state.supervisor_mode)
 
+        active_faults = ",".join([str(ev.get("type", "")) for ev in fault.active_events(t)])
+        fault_rows.append(
+            {
+                "t_s": float(t),
+                "active_faults": active_faults,
+                "dropout_agent_id": ";".join(str(x) for x in dropped_agents),
+                "sensor_bad_agent_id": ";".join(str(x) for x in sensor_bad_agents),
+                "comm_scale": float(comm_scale),
+            }
+        )
+
     os.makedirs("outputs/csv", exist_ok=True)
     out_path = f"outputs/csv/{args.controller}_seed{args.seed}.csv"
     pd.DataFrame(rows).to_csv(out_path, index=False)
+    if fault.enabled:
+        os.makedirs("outputs/faults", exist_ok=True)
+        fault_path = f"outputs/faults/{args.controller}_seed{args.seed}_faults_timeline.csv"
+        pd.DataFrame(fault_rows).to_csv(fault_path, index=False)
+        print(f"Saved: {fault_path}")
     print(f"Saved: {out_path}")
     env.close()
 

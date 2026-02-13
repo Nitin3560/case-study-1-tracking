@@ -51,6 +51,12 @@ class AgenticSupervisor:
         self.phase_boost_s = float(sup_cfg.get("phase_boost_s", 0.0))
         self.phase_boost_rate_mps = float(sup_cfg.get("phase_boost_rate_mps", 0.0))
         self.phase_boost_smooth_alpha = float(sup_cfg.get("phase_boost_smooth_alpha", self.smooth_alpha_active))
+        self.ref_shift_hold_decay = float(sup_cfg.get("ref_shift_hold_decay", 0.995))
+        self.comm_freeze_refshift = bool(sup_cfg.get("comm_freeze_refshift", True))
+        self.comm_freeze_conn_thresh = float(sup_cfg.get("comm_freeze_conn_thresh", 0.18))
+        self.comm_freeze_ratio_thresh = float(sup_cfg.get("comm_freeze_ratio_thresh", 0.60))
+        self.ref_shift_freeze_mode = str(sup_cfg.get("ref_shift_freeze_mode", "hold")).lower()
+        self.ref_shift_freeze_decay = float(sup_cfg.get("ref_shift_freeze_decay", 0.995))
 
         self._last_phase_id = None
         self._phase_boost_timer = 0.0
@@ -59,6 +65,8 @@ class AgenticSupervisor:
         self._hold_timer = 0.0
         self._last_err_com = None
         self._hard_timer = 0.0
+        self._prev_com = np.zeros(3, dtype=float)
+        self._conn_ref = None
 
         self.state = SupervisorState(
             ref_shift=np.zeros(3, dtype=float),
@@ -85,11 +93,31 @@ class AgenticSupervisor:
         connectivity_rate: float,
         sat_mean: float,
         phase_id: int,
+        comm_scale: float = 1.0,
+        active_mask: np.ndarray | None = None,
+        trusted_mask: np.ndarray | None = None,
+        sensor_corrupt_mask: np.ndarray | None = None,
     ) -> SupervisorState:
         sup_dt = self._sup_timer
         self._sup_timer = 0.0
 
-        com = pos_true.mean(axis=0)
+        n = pos_true.shape[0]
+        if active_mask is None:
+            active_mask = np.ones(n, dtype=bool)
+        if trusted_mask is None:
+            trusted_mask = np.asarray(active_mask, dtype=bool).copy()
+        if sensor_corrupt_mask is None:
+            sensor_corrupt_mask = np.zeros(n, dtype=bool)
+
+        trusted_idx = np.where(np.asarray(trusted_mask, dtype=bool))[0]
+        active_idx = np.where(np.asarray(active_mask, dtype=bool))[0]
+        if trusted_idx.size >= 2:
+            com = pos_true[trusted_idx].mean(axis=0)
+        elif active_idx.size > 0:
+            com = pos_true[active_idx].mean(axis=0)
+        else:
+            com = self._prev_com.copy()
+        self._prev_com = np.asarray(com, dtype=float).copy()
         com_ref = p_ref_now
         err_com = float(np.linalg.norm((com - com_ref)[:2]))
 
@@ -135,12 +163,35 @@ class AgenticSupervisor:
         self.state.formation_scale = 1.0
         self.state.int_hold = False
 
+        sensing_compromised = bool(np.any(np.asarray(sensor_corrupt_mask, dtype=bool) & np.asarray(active_mask, dtype=bool)))
+        comm_fault_active = float(comm_scale) < 0.999
+        if self._conn_ref is None:
+            self._conn_ref = float(connectivity_rate)
+        elif not comm_fault_active:
+            # Track nominal connectivity baseline only outside explicit comm faults.
+            self._conn_ref = 0.98 * float(self._conn_ref) + 0.02 * float(connectivity_rate)
+        conn_ratio = float(connectivity_rate) / max(1e-6, float(self._conn_ref))
+        freeze_refshift = bool(
+            self.comm_freeze_refshift
+            and (
+                float(connectivity_rate) < self.comm_freeze_conn_thresh
+                or conn_ratio < self.comm_freeze_ratio_thresh
+            )
+        )
+
+        if sensing_compromised:
+            self.state.ref_shift[:2] *= float(np.clip(self.ref_shift_hold_decay, 0.0, 1.0))
+
+        if freeze_refshift:
+            if self.ref_shift_freeze_mode == "decay":
+                self.state.ref_shift[:2] *= float(np.clip(self.ref_shift_freeze_decay, 0.0, 1.0))
+
         if mode == 3:
             self.state.formation_scale = self.formation_scale_min
             self.state.smooth_alpha = self.smooth_alpha_active
         elif mode == 2:
             self.state.int_hold = True
-        elif mode == 1:
+        elif mode == 1 and not sensing_compromised:
             delta = (com - com_ref)
             delta[2] = 0.0
             norm = float(np.linalg.norm(delta[:2]))
@@ -152,7 +203,13 @@ class AgenticSupervisor:
                     self.state.ref_shift[:2] *= self.ref_shift_max_m / (rnorm + 1e-9)
 
         # Late-phase recovery: allow small, bounded re-anchor even when drift correction is disabled
-        if phase_id >= self.drift_disable_phase_ge and self.recovery_ref_shift_rate_mps > 0.0 and err_com > self.err_thresh_m:
+        if (
+            (not sensing_compromised)
+            and (not freeze_refshift)
+            and phase_id >= self.drift_disable_phase_ge
+            and self.recovery_ref_shift_rate_mps > 0.0
+            and err_com > self.err_thresh_m
+        ):
             delta = (com - com_ref)
             delta[2] = 0.0
             norm = float(np.linalg.norm(delta[:2]))
@@ -166,7 +223,7 @@ class AgenticSupervisor:
         # Phase transition boost: faster re-anchor + less smoothing for a short window
         if self._phase_boost_timer > 0.0:
             self.state.smooth_alpha = max(self.state.smooth_alpha, self.phase_boost_smooth_alpha)
-            if self.phase_boost_rate_mps > 0.0 and err_com > self.err_thresh_m:
+            if (not sensing_compromised) and (not freeze_refshift) and self.phase_boost_rate_mps > 0.0 and err_com > self.err_thresh_m:
                 delta = (com - com_ref)
                 delta[2] = 0.0
                 norm = float(np.linalg.norm(delta[:2]))

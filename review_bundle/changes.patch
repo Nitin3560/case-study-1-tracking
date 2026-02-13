@@ -1,0 +1,63 @@
+diff --git a/configs/scenario_paper_figure.yaml b/configs/scenario_paper_figure.yaml
+index 945462b..091291f 100644
+--- a/configs/scenario_paper_figure.yaml
++++ b/configs/scenario_paper_figure.yaml
+@@ -123,3 +123,6 @@ controllers:
+       err_hard_m: 3.5
+       hard_hold_s: 1.5
+       recovery_ref_shift_rate_mps: 0.06
++      phase_boost_s: 4.0
++      phase_boost_rate_mps: 0.12
++      phase_boost_smooth_alpha: 0.85
+diff --git a/src/controllers/agentic_supervisor.py b/src/controllers/agentic_supervisor.py
+index 4fb458a..01057df 100644
+--- a/src/controllers/agentic_supervisor.py
++++ b/src/controllers/agentic_supervisor.py
+@@ -48,6 +48,12 @@ class AgenticSupervisor:
+         self.err_hard_m = float(sup_cfg.get("err_hard_m", 1e9))
+         self.hard_hold_s = float(sup_cfg.get("hard_hold_s", 0.0))
+         self.recovery_ref_shift_rate_mps = float(sup_cfg.get("recovery_ref_shift_rate_mps", 0.0))
++        self.phase_boost_s = float(sup_cfg.get("phase_boost_s", 0.0))
++        self.phase_boost_rate_mps = float(sup_cfg.get("phase_boost_rate_mps", 0.0))
++        self.phase_boost_smooth_alpha = float(sup_cfg.get("phase_boost_smooth_alpha", self.smooth_alpha_active))
++
++        self._last_phase_id = None
++        self._phase_boost_timer = 0.0
+ 
+         self._sup_timer = 0.0
+         self._hold_timer = 0.0
+@@ -103,6 +109,13 @@ class AgenticSupervisor:
+         self._hard_timer = max(0.0, self._hard_timer - sup_dt)
+ 
+         mode = 0
++        # phase change detection
++        if self._last_phase_id is None or phase_id != self._last_phase_id:
++            self._phase_boost_timer = self.phase_boost_s
++        self._last_phase_id = phase_id
++        if self._phase_boost_timer > 0.0:
++            self._phase_boost_timer = max(0.0, self._phase_boost_timer - sup_dt)
++
+         if connectivity_rate < self.conn_thresh:
+             mode = 3
+         elif self._hard_timer > 0.0 or sat_mean > self.sat_hold_thresh:
+@@ -150,6 +163,20 @@ class AgenticSupervisor:
+                 if rnorm > self.ref_shift_max_m:
+                     self.state.ref_shift[:2] *= self.ref_shift_max_m / (rnorm + 1e-9)
+ 
++        # Phase transition boost: faster re-anchor + less smoothing for a short window
++        if self._phase_boost_timer > 0.0:
++            self.state.smooth_alpha = max(self.state.smooth_alpha, self.phase_boost_smooth_alpha)
++            if self.phase_boost_rate_mps > 0.0 and err_com > self.err_thresh_m:
++                delta = (com - com_ref)
++                delta[2] = 0.0
++                norm = float(np.linalg.norm(delta[:2]))
++                if norm > 1e-9:
++                    step = (delta / norm) * min(norm, self.phase_boost_rate_mps * sup_dt)
++                    self.state.ref_shift += step
++                    rnorm = float(np.linalg.norm(self.state.ref_shift[:2]))
++                    if rnorm > self.ref_shift_max_m:
++                        self.state.ref_shift[:2] *= self.ref_shift_max_m / (rnorm + 1e-9)
++
+         # decay ref_shift toward 0
+         if self.ref_shift_decay_mps > 0.0:
+             rnorm = float(np.linalg.norm(self.state.ref_shift[:2]))
